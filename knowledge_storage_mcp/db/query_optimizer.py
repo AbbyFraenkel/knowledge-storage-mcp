@@ -1,284 +1,379 @@
 """
-Query optimizer for Neo4j client.
+Query optimization module for Knowledge Storage MCP.
 
-This module provides optimization strategies for Neo4j queries,
-improving performance for large knowledge graphs.
+This module provides advanced query optimization capabilities for Neo4j queries,
+including caching, performance monitoring, and hint management.
 """
 
-from typing import Dict, List, Any, Optional, Tuple
+import time
+import re
+from collections import OrderedDict
+from threading import RLock
+from typing import Dict, Any, List, Optional, Union, Tuple
+
 from loguru import logger
+
+
+class QueryCache:
+    """
+    LRU cache for Neo4j query results with size limit and TTL.
+    
+    This class provides thread-safe caching for query results with
+    configurable size limits and expiration.
+    """
+    
+    def __init__(self, max_size: int = 100, ttl: int = 3600):
+        """
+        Initialize query cache.
+        
+        Args:
+            max_size: Maximum number of cached queries
+            ttl: Time-to-live in seconds for cache entries
+        """
+        self.max_size = max_size
+        self.ttl = ttl
+        self._cache = OrderedDict()  # LRU cache
+        self._timestamps = {}  # Entry timestamps
+        self._lock = RLock()  # Thread safety
+        self._hits = 0
+        self._misses = 0
+        
+    def get(self, key: str) -> Optional[Any]:
+        """
+        Get result from cache if available and not expired.
+        
+        Args:
+            key: Cache key (normalized query hash)
+            
+        Returns:
+            Cached result or None if not found/expired
+        """
+        with self._lock:
+            if key not in self._cache:
+                self._misses += 1
+                return None
+                
+            # Check if entry has expired
+            entry_time = self._timestamps.get(key, 0)
+            if self.ttl > 0 and time.time() - entry_time > self.ttl:
+                self._remove(key)
+                self._misses += 1
+                return None
+                
+            # Move to end of LRU (most recently used)
+            value = self._cache.pop(key)
+            self._cache[key] = value
+            self._hits += 1
+            return value
+            
+    def set(self, key: str, value: Any) -> None:
+        """
+        Add or update cache entry.
+        
+        Args:
+            key: Cache key (normalized query hash)
+            value: Result to cache
+        """
+        with self._lock:
+            # If key exists, update its position
+            if key in self._cache:
+                self._cache.pop(key)
+                
+            # Add new entry
+            self._cache[key] = value
+            self._timestamps[key] = time.time()
+            
+            # Ensure size limit
+            if len(self._cache) > self.max_size:
+                # Remove oldest entry (first in OrderedDict)
+                oldest_key = next(iter(self._cache))
+                self._remove(oldest_key)
+                
+    def _remove(self, key: str) -> None:
+        """
+        Remove entry from cache.
+        
+        Args:
+            key: Cache key to remove
+        """
+        if key in self._cache:
+            del self._cache[key]
+        if key in self._timestamps:
+            del self._timestamps[key]
+            
+    def clear(self) -> None:
+        """Clear all cache entries."""
+        with self._lock:
+            self._cache.clear()
+            self._timestamps.clear()
+            
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get cache statistics.
+        
+        Returns:
+            Dictionary with cache statistics
+        """
+        with self._lock:
+            total_requests = self._hits + self._misses
+            hit_rate = self._hits / total_requests if total_requests > 0 else 0
+            
+            return {
+                "size": len(self._cache),
+                "max_size": self.max_size,
+                "ttl": self.ttl,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": hit_rate,
+                "total_requests": total_requests
+            }
 
 
 class QueryOptimizer:
     """
-    Query optimizer for Neo4j client.
+    Query optimizer for Neo4j queries.
     
-    This class provides methods for optimizing Cypher queries,
-    implementing indexing strategies, and improving performance
-    for large knowledge graphs.
+    This class provides methods for optimizing Neo4j queries, including
+    caching, performance monitoring, and hint management.
     """
     
-    def __init__(self):
-        """Initialize query optimizer."""
-        self.index_hints = {
-            "Document": ["id", "title", "year"],
-            "Concept": ["id", "name", "domain"],
-            "Symbol": ["id", "name", "latex", "context"],
-            "Algorithm": ["id", "name", "complexity"],
-            "Implementation": ["id", "name", "language"],
-            "Domain": ["id", "name"]
-        }
-    
-    def create_indices(self, session) -> None:
+    def __init__(self, cache_size: int = 100, cache_ttl: int = 3600):
         """
-        Create indices for entity properties to improve query performance.
+        Initialize query optimizer.
         
         Args:
-            session: Neo4j session
+            cache_size: Maximum number of cached queries
+            cache_ttl: Time-to-live in seconds for cache entries
         """
-        for entity_type, properties in self.index_hints.items():
-            for prop in properties:
-                try:
-                    # Create index if it doesn't exist
-                    # Neo4j 5+ syntax
-                    query = f"""
-                    CREATE INDEX IF NOT EXISTS FOR (n:{entity_type}) ON (n.{prop})
-                    """
-                    session.run(query)
-                    logger.info(f"Created or verified index on {entity_type}.{prop}")
-                except Exception as e:
-                    logger.error(f"Error creating index on {entity_type}.{prop}: {str(e)}")
-    
-    def optimize_query(self, query_params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        self.cache = QueryCache(max_size=cache_size, ttl=cache_ttl)
+        self.query_metrics = {}  # Track query execution times
+        
+    def normalize_query(self, query: str) -> str:
         """
-        Optimize a query based on the provided parameters.
+        Normalize Cypher query for consistent hashing.
         
         Args:
-            query_params: Query parameters
+            query: Cypher query to normalize
             
         Returns:
-            Tuple of (optimized_query, parameters)
+            Normalized query string
         """
-        # Extract query parameters
-        entity_types = query_params.get("entity_types", [])
-        properties = query_params.get("properties", {})
-        relationships = query_params.get("relationships", [])
-        filters = query_params.get("filters", {})
-        pagination = query_params.get("pagination", {"skip": 0, "limit": 100})
+        # Remove whitespace variations
+        query = re.sub(r'\s+', ' ', query.strip())
         
-        # Build optimized Cypher query
-        query_parts = []
-        where_clauses = []
-        return_clauses = ["e"]
-        parameters = {}
+        # Normalize case for keywords
+        pattern = re.compile(r'\b(MATCH|WHERE|RETURN|ORDER BY|SKIP|LIMIT|CREATE|SET|MERGE|DELETE|REMOVE|WITH|UNWIND)\b', re.IGNORECASE)
+        query = pattern.sub(lambda m: m.group(0).upper(), query)
         
-        # Start with the most selective patterns first
-        # If we have specific properties, use those in the initial MATCH
-        if properties and entity_types:
-            # Find the most selective property based on index hints
-            selective_props = []
-            for entity_type in entity_types:
-                if entity_type in self.index_hints:
-                    for prop in properties:
-                        if prop in self.index_hints[entity_type]:
-                            selective_props.append((entity_type, prop))
+        # Remove comments
+        query = re.sub(r'//.*?$', '', query, flags=re.MULTILINE)
+        query = re.sub(r'/\*.*?\*/', '', query, flags=re.DOTALL)
+        
+        return query
+        
+    def compute_query_hash(self, query: str, parameters: Dict[str, Any]) -> str:
+        """
+        Compute hash for query and parameters.
+        
+        Args:
+            query: Cypher query
+            parameters: Query parameters
             
-            if selective_props:
-                # Use the most selective property in the initial MATCH
-                entity_type, prop = selective_props[0]
-                value = properties[prop]
-                entity_label = ":".join(entity_types)
+        Returns:
+            Query hash string
+        """
+        normalized_query = self.normalize_query(query)
+        
+        # Convert parameters to a stable string representation
+        param_str = str(sorted(parameters.items()))
+        
+        # Combine and hash
+        return f"{hash(normalized_query)}:{hash(param_str)}"
+        
+    def apply_hints(self, query: str, hints: List[str]) -> str:
+        """
+        Apply Neo4j query hints.
+        
+        Args:
+            query: Cypher query
+            hints: List of hints to apply
+            
+        Returns:
+            Query with hints applied
+        """
+        if not hints:
+            return query
+            
+        hint_str = " ".join(f"USING {hint}" for hint in hints)
+        
+        # Find appropriate location to insert hints
+        match = re.search(r'\b(MATCH|OPTIONAL\s+MATCH)\b', query, re.IGNORECASE)
+        if match:
+            # Insert hint after MATCH keyword
+            pos = match.end()
+            return query[:pos] + f" {hint_str} " + query[pos:]
+        else:
+            # Fall back to prepending hint
+            return f"/*+ {' '.join(hints)} */ {query}"
+            
+    def optimize_query(
+        self, 
+        query: str, 
+        parameters: Dict[str, Any], 
+        hints: Optional[List[str]] = None,
+        force_bypass_cache: bool = False
+    ) -> Tuple[str, Dict[str, Any], Optional[str]]:
+        """
+        Optimize a Cypher query for execution.
+        
+        Args:
+            query: Cypher query to optimize
+            parameters: Query parameters
+            hints: Optional query hints to apply
+            force_bypass_cache: Whether to bypass cache lookup
+            
+        Returns:
+            Tuple of (optimized_query, parameters, cache_key)
+        """
+        # Apply hints if provided
+        optimized_query = self.apply_hints(query, hints or [])
+        
+        # Compute cache key
+        cache_key = self.compute_query_hash(query, parameters)
+        
+        # For monitoring, even if we bypass cache
+        self.query_metrics.setdefault(cache_key, {
+            "count": 0,
+            "total_time": 0,
+            "avg_time": 0,
+            "min_time": float('inf'),
+            "max_time": 0,
+            "last_parameters": None
+        })
+        
+        if force_bypass_cache:
+            return optimized_query, parameters, None
+        
+        return optimized_query, parameters, cache_key
+        
+    def execute_query(
+        self,
+        session_run_func,
+        query: str,
+        parameters: Dict[str, Any],
+        hints: Optional[List[str]] = None,
+        bypass_cache: bool = False,
+        max_result_size: Optional[int] = None
+    ) -> Any:
+        """
+        Execute a query with optimization and caching.
+        
+        Args:
+            session_run_func: Function to run Neo4j session query
+            query: Cypher query to execute
+            parameters: Query parameters
+            hints: Optional query hints to apply
+            bypass_cache: Whether to bypass cache
+            max_result_size: Maximum result size to cache
+            
+        Returns:
+            Query results
+        """
+        # Optimize query
+        optimized_query, parameters, cache_key = self.optimize_query(
+            query, parameters, hints, bypass_cache
+        )
+        
+        # Check cache if not bypassing
+        if not bypass_cache and cache_key:
+            cached_result = self.cache.get(cache_key)
+            if cached_result is not None:
+                logger.debug(f"Cache hit for query: {optimized_query[:100]}...")
+                return cached_result
                 
-                query_parts.append(f"MATCH (e:{entity_label} {{{prop}: ${prop}}})")
-                parameters[prop] = value
-                
-                # Remove this property from further WHERE clauses
-                properties_copy = properties.copy()
-                properties_copy.pop(prop)
-                
-                # Add remaining properties to WHERE clause
-                for key, value in properties_copy.items():
-                    where_clauses.append(f"e.{key} = ${key}")
-                    parameters[key] = value
+        # Execute query and measure performance
+        start_time = time.time()
+        try:
+            result = session_run_func(optimized_query, parameters=parameters)
+            
+            # Convert result to cacheable form (list of dictionaries)
+            if hasattr(result, 'data'):
+                records = result.data()
             else:
-                # No selective properties, use standard MATCH with entity types
-                entity_labels = ":".join(entity_types)
-                query_parts.append(f"MATCH (e:{entity_labels})")
+                # Already in data form
+                records = result
                 
-                # Add all properties to WHERE clause
-                for key, value in properties.items():
-                    where_clauses.append(f"e.{key} = ${key}")
-                    parameters[key] = value
-        elif entity_types:
-            # Use entity types in MATCH
-            entity_labels = ":".join(entity_types)
-            query_parts.append(f"MATCH (e:{entity_labels})")
-        else:
-            # No entity types specified, use general MATCH
-            query_parts.append("MATCH (e)")
+            execution_time = time.time() - start_time
+            
+            # Update metrics
+            if cache_key:
+                metrics = self.query_metrics[cache_key]
+                metrics["count"] += 1
+                metrics["total_time"] += execution_time
+                metrics["avg_time"] = metrics["total_time"] / metrics["count"]
+                metrics["min_time"] = min(metrics["min_time"], execution_time)
+                metrics["max_time"] = max(metrics["max_time"], execution_time)
+                metrics["last_parameters"] = {k: str(v)[:100] for k, v in parameters.items()}
                 
-        # Handle filters
-        if filters:
-            for key, value in filters.items():
-                if isinstance(value, dict):
-                    # Handle operators like >, <, >=, <=
-                    operator = value.get("operator", "=")
-                    filter_value = value.get("value")
-                    if filter_value is not None:
-                        where_clauses.append(f"e.{key} {operator} ${key}")
-                        parameters[key] = filter_value
+            # Log slow queries
+            if execution_time > 1.0:  # Threshold for slow query
+                logger.warning(f"Slow query ({execution_time:.2f}s): {optimized_query[:100]}...")
+                
+            # Cache result if not bypassing and not too large
+            if not bypass_cache and cache_key:
+                # Check result size if limit specified
+                if max_result_size is None or (
+                    isinstance(records, list) and len(records) <= max_result_size
+                ):
+                    self.cache.set(cache_key, records)
                 else:
-                    where_clauses.append(f"e.{key} = ${key}")
-                    parameters[key] = value
-        
-        # Handle relationships - use separate MATCH clauses for better performance
-        if relationships:
-            for i, rel in enumerate(relationships):
-                rel_type = rel.get("type", "")
-                direction = rel.get("direction", "outgoing")
-                target_label = rel.get("target_type", "")
-                
-                # Build relationship pattern
-                if direction == "outgoing":
-                    pattern = f"MATCH (e)-[r{i}:{rel_type}]->(related{i}"
-                elif direction == "incoming":
-                    pattern = f"MATCH (e)<-[r{i}:{rel_type}]-(related{i}"
-                else:  # bidirectional
-                    pattern = f"MATCH (e)-[r{i}:{rel_type}]-(related{i}"
+                    logger.debug(f"Result too large to cache ({len(records)} items)")
                     
-                # Add target label if specified
-                if target_label:
-                    pattern += f":{target_label}"
-                    
-                pattern += ")"
-                query_parts.append(pattern)
-                return_clauses.append(f"r{i}")
-                return_clauses.append(f"related{i}")
-        
-        # Add WHERE clause if needed
-        if where_clauses:
-            query_parts.append("WHERE " + " AND ".join(where_clauses))
+            return records
             
-        # Add RETURN clause - include DISTINCT for better performance
-        query_parts.append("RETURN DISTINCT " + ", ".join(return_clauses))
-        
-        # Add efficient pagination
-        # For large result sets, use WHERE clause with IDs instead of SKIP
-        skip = pagination.get("skip", 0)
-        limit = pagination.get("limit", 100)
-        
-        # Add a reasonable LIMIT clause to prevent excessive memory usage
-        max_limit = 1000  # Maximum number of records to return
-        effective_limit = min(limit, max_limit)
-        
-        if skip > 0:
-            query_parts.append(f"SKIP {skip} LIMIT {effective_limit}")
-        else:
-            query_parts.append(f"LIMIT {effective_limit}")
-        
-        # Join query parts
-        query = "\n".join(query_parts)
-        
-        return query, parameters
-    
-    def get_indexing_statements(self) -> List[str]:
-        """
-        Get Cypher statements for creating all recommended indices.
-        
-        Returns:
-            List of Cypher statements for index creation
-        """
-        statements = []
-        
-        for entity_type, properties in self.index_hints.items():
-            for prop in properties:
-                # Neo4j 5+ syntax
-                statement = f"""
-                CREATE INDEX IF NOT EXISTS FOR (n:{entity_type}) ON (n.{prop})
-                """
-                statements.append(statement)
-                
-        return statements
-    
-    def generate_query_explanation(self, query: str, parameters: Dict[str, Any], session) -> str:
-        """
-        Generate explanation for a query to understand its execution plan.
-        
-        Args:
-            query: Cypher query
-            parameters: Query parameters
-            session: Neo4j session
-            
-        Returns:
-            Query explanation
-        """
-        try:
-            explanation_query = f"EXPLAIN {query}"
-            result = session.run(explanation_query, parameters=parameters)
-            summary = result.consume()
-            
-            # Format the explanation
-            explanation = f"Query Plan for: {query}\n\n"
-            explanation += f"Estimated rows: {summary.counters}\n"
-            
-            return explanation
         except Exception as e:
-            logger.error(f"Error generating query explanation: {str(e)}")
-            return f"Error generating explanation: {str(e)}"
-    
-    def analyze_query(self, query: str, parameters: Dict[str, Any], session) -> Dict[str, Any]:
+            execution_time = time.time() - start_time
+            logger.error(f"Query error ({execution_time:.2f}s): {str(e)}")
+            raise
+            
+    def get_query_metrics(self, limit: int = 10) -> List[Dict[str, Any]]:
         """
-        Analyze a query to get performance metrics.
+        Get metrics for executed queries.
         
         Args:
-            query: Cypher query
-            parameters: Query parameters
-            session: Neo4j session
+            limit: Maximum number of queries to return, sorted by average time
             
         Returns:
-            Performance metrics
+            List of query metrics
         """
-        try:
-            # Use PROFILE to get detailed execution metrics
-            profile_query = f"PROFILE {query}"
-            result = session.run(profile_query, parameters=parameters)
-            summary = result.consume()
-            
-            # Extract performance metrics
-            metrics = {
-                "execution_time_ms": summary.result_available_after,
-                "records_affected": summary.counters.contains_updates and summary.counters.nodes_created or 0,
-                "db_hits": getattr(summary, "db_hits", 0),
-                "rows": getattr(summary, "result_available_after", 0)
-            }
-            
-            return metrics
-        except Exception as e:
-            logger.error(f"Error analyzing query: {str(e)}")
-            return {"error": str(e)}
-    
-    def suggest_query_improvements(self, metrics: Dict[str, Any]) -> List[str]:
-        """
-        Suggest improvements based on query performance metrics.
+        # Sort by average execution time (descending)
+        sorted_metrics = sorted(
+            [
+                {"query_hash": k, **v} 
+                for k, v in self.query_metrics.items()
+                if v["count"] > 0  # Only include executed queries
+            ],
+            key=lambda x: x["avg_time"],
+            reverse=True
+        )
         
-        Args:
-            metrics: Performance metrics
-            
+        return sorted_metrics[:limit]
+        
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """
+        Get cache statistics.
+        
         Returns:
-            List of improvement suggestions
+            Dictionary with cache statistics
         """
-        suggestions = []
+        return self.cache.get_stats()
         
-        # Check execution time
-        if metrics.get("execution_time_ms", 0) > 1000:
-            suggestions.append("Query is slow (>1000ms). Consider adding more specific indices or refining the query.")
+    def clear_cache(self) -> None:
+        """Clear query cache."""
+        self.cache.clear()
+        logger.info("Query cache cleared")
         
-        # Check database hits
-        if metrics.get("db_hits", 0) > 10000:
-            suggestions.append("High number of database hits. Consider adding more selective filters or indices.")
-        
-        # General suggestions if no specific issues found
-        if not suggestions:
-            suggestions.append("Query performance is acceptable. Consider batch processing for large operations.")
-        
-        return suggestions
+    def reset_metrics(self) -> None:
+        """Reset query performance metrics."""
+        self.query_metrics = {}
+        logger.info("Query metrics reset")
